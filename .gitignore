@@ -26,3 +26,4 @@ node_modules/
 # Logs
 *.log
 EOF
+face/outputs/
