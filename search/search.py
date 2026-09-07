@@ -1,23 +1,4 @@
-"""Public P2 web/social search interface.
-
-Input:
-    {"image_path": str, "face_encoding": [...]}
-
-Output:
-    {
-      "matched_url": str,
-      "platform": str,
-      "image_url": str | None,
-      "caption": str | None,
-      "author": str | None,
-      "timestamp": str | None,
-      "confidence": float,
-      "face_verified": bool,
-      "face_distance": float | None
-    }
-
-The search is live. No social URL is hardcoded.
-"""
+"""Public P2 web/social search interface."""
 
 from __future__ import annotations
 
@@ -28,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from .filters import is_social_url, platform_for_url
-from .face_match import compare_faces, download_image
+from .face_match import (
+    compare_faces,
+    download_image,
+    resolve_profile_page,
+)
 from .serpapi_fallback import search_lens
 from .vision_search import detect_web
 
@@ -42,10 +27,9 @@ def _vision_candidates(
     for item in data.get("pages", []):
         url = item.get("url")
 
-        # IMPORTANT:
-        # Vision only considers social/profile pages.
-        # This prevents generic university staff directories
-        # from winning before the SerpApi fallback runs.
+        # Only allow social/profile pages from Vision.
+        # Generic university directories should be handled
+        # by the SerpApi fallback instead.
         if not url or not is_social_url(url):
             continue
 
@@ -77,9 +61,6 @@ def _serp_candidates(
 ) -> list[dict[str, Any]]:
 
     candidates = []
-
-    # SerpApi returns a LIST of normalized candidates.
-    # Do NOT call .get() on items itself.
 
     for item in items:
         url = item.get("url")
@@ -141,21 +122,21 @@ def _select_best(
                 image_url
             )
 
-            face_result = compare_faces(
+            result = compare_faces(
                 reference_image,
                 candidate_path,
             )
 
-            candidate["face_verified"] = (
-                face_result["verified"]
+            candidate["face_verified"] = bool(
+                result["verified"]
             )
 
-            candidate["face_distance"] = (
-                face_result["distance"]
+            candidate["face_distance"] = float(
+                result["distance"]
             )
 
-            candidate["face_threshold"] = (
-                face_result["threshold"]
+            candidate["face_threshold"] = float(
+                result["threshold"]
             )
 
             print(
@@ -165,7 +146,7 @@ def _select_best(
                 f"{candidate['face_distance']}"
             )
 
-            if face_result["verified"]:
+            if candidate["face_verified"]:
                 verified_candidates.append(
                     candidate
                 )
@@ -190,8 +171,8 @@ def _select_best(
     if not verified_candidates:
         return None
 
-    # Lower FaceNet distance = better face match.
-    return min(
+    # Select the strongest face match.
+    best = min(
         verified_candidates,
         key=lambda item:
             item["face_distance"]
@@ -199,11 +180,53 @@ def _select_best(
             else float("inf"),
     )
 
+    # ---------------------------------------------------------
+    # Try to turn a generic directory/staff page into the
+    # person's specific profile page.
+    # ---------------------------------------------------------
+
+    try:
+
+        profile = resolve_profile_page(
+            best["url"],
+            reference_image,
+        )
+
+        if profile:
+
+            print(
+                "\nResolved directory page to exact profile page:"
+            )
+
+            print(
+                f"  {profile['profile_url']}"
+            )
+
+            best["url"] = profile[
+                "profile_url"
+            ]
+
+            best["image_url"] = profile[
+                "image_url"
+            ]
+
+            best["face_distance"] = profile.get(
+                "face_distance",
+                best["face_distance"],
+            )
+
+    except Exception as exc:
+
+        print(
+            f"Profile resolution skipped: {exc}"
+        )
+
+    return best
+
 
 def search_web(
     p1_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Search the supplied image and return verified web evidence."""
 
     image_path = p1_payload.get(
         "image_path"
@@ -219,10 +242,8 @@ def search_web(
             f"Image not found: {image_path}"
         )
 
-    vision_error: str | None = None
-
     # =========================================================
-    # 1. GOOGLE CLOUD VISION
+    # 1. GOOGLE VISION
     # =========================================================
 
     try:
@@ -231,14 +252,19 @@ def search_web(
             image_path
         )
 
-        candidate = _select_best(
+        vision_candidates = (
             _vision_candidates(
                 vision_data
-            ),
+            )
+        )
+
+        candidate = _select_best(
+            vision_candidates,
             image_path,
         )
 
         if candidate:
+
             print(
                 "\nFound a face-verified Vision result."
             )
@@ -247,14 +273,12 @@ def search_web(
 
     except Exception as exc:
 
-        vision_error = str(exc)
-
         print(
             f"Vision search failed: {exc}"
         )
 
     # =========================================================
-    # 2. SERPAPI / GOOGLE LENS FALLBACK
+    # 2. SERPAPI / GOOGLE LENS
     # =========================================================
 
     try:
@@ -263,41 +287,44 @@ def search_web(
             image_path
         )
 
+        serp_candidates = _serp_candidates(
+            serp_results
+        )
+
         candidate = _select_best(
-            _serp_candidates(
-                serp_results
-            ),
+            serp_candidates,
             image_path,
         )
 
+        if candidate:
+
+            print(
+                "\nFound a face-verified SerpApi result."
+            )
+
+            return _output(candidate)
+
     except Exception as exc:
 
-        if vision_error:
-
-            raise RuntimeError(
-                f"Vision search failed: "
-                f"{vision_error}; "
-                f"SerpApi fallback failed: {exc}"
-            ) from exc
-
-        raise
-
-    # =========================================================
-    # 3. NO VERIFIED RESULT
-    # =========================================================
-
-    if not candidate:
-
-        raise LookupError(
-            "No face-verified result found "
-            "from Vision or SerpApi"
+        print(
+            f"SerpApi search failed: {exc}"
         )
 
-    print(
-        "\nFound a face-verified SerpApi result."
-    )
+    # =========================================================
+    # 3. NOTHING FOUND
+    # =========================================================
 
-    return _output(candidate)
+    return {
+        "matched_url": None,
+        "platform": None,
+        "image_url": None,
+        "caption": None,
+        "author": None,
+        "timestamp": None,
+        "confidence": 0.0,
+        "face_verified": False,
+        "face_distance": None,
+    }
 
 
 def _output(
@@ -305,7 +332,9 @@ def _output(
 ) -> dict[str, Any]:
 
     return {
-        "matched_url": candidate["url"],
+        "matched_url": candidate.get(
+            "url"
+        ),
 
         "platform": candidate.get(
             "platform"
@@ -358,10 +387,7 @@ def main() -> None:
 
     parser.add_argument(
         "image",
-        help=(
-            "Path to the consenting "
-            "demo image"
-        ),
+        help="Path to the demo image",
     )
 
     args = parser.parse_args()
