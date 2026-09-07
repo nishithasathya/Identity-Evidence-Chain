@@ -30,10 +30,8 @@ from typing import Any
 from .filters import is_social_url, platform_for_url
 from .face_match import compare_faces, download_image
 from .serpapi_fallback import search_lens
-from .vision_search import detect_web
 
 
-def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = []
 
     for item in data.get("pages", []):
@@ -64,6 +62,9 @@ def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
 
     return candidates
 
+        candidates.extend(
+            vision_candidates
+        )
 
 def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates = []
@@ -94,6 +95,17 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     return candidates
 
+    # SerpApi provides the main Google Lens fallback.
+    if not candidates:
+        try:
+            candidates = search_lens(
+                image_path
+            )
+
+        except Exception as exc:
+            print(
+                f"SerpApi search failed: {exc}"
+            )
 
 def _select_best(
     candidates: list[dict[str, Any]],
@@ -156,6 +168,12 @@ def _select_best(
         else float("inf"),
     )
 
+    if not candidates:
+        return {
+            "success": False,
+            "message": "No allowed public web candidates found.",
+            "candidates": [],
+        }
 
 def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
     """Search the supplied image and return verified web evidence."""
@@ -223,8 +241,28 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
 
     return _output(candidate)
 
+    return result
 
-def _output(candidate: dict[str, Any]) -> dict[str, Any]:
+
+def _build_result(
+    best: dict,
+    profile: dict | None,
+    verified: list[dict],
+) -> dict:
+    """Build a stable result object for downstream evidence storage."""
+
+    original_url = best.get(
+        "url"
+    )
+
+    matched_url = original_url
+
+    if profile:
+        matched_url = profile.get(
+            "profile_url",
+            original_url,
+        )
+
     return {
         "matched_url": candidate["url"],
         "platform": candidate.get("platform"),
@@ -275,4 +313,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    print(
+        "Use main.py to run the complete "
+        "Identity-Evidence-Chain pipeline."
+    )
