@@ -1,47 +1,99 @@
-"""Public web evidence search and face-based candidate verification."""
+"""Public P2 web/social search interface.
+
+Input:
+    {"image_path": str, "face_encoding": [...]}
+
+Output:
+    {
+      "matched_url": str,
+      "platform": str,
+      "image_url": str | None,
+      "caption": str | None,
+      "author": str | None,
+      "timestamp": str | None,
+      "confidence": float,
+      "face_verified": bool,
+      "face_distance": float | None
+    }
+
+The search is live. No social URL is hardcoded.
+"""
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+from pathlib import Path
 from typing import Any
 
-from .face_match import (
-    compare_faces,
-    download_image,
-    resolve_profile_page,
-)
-from .filters import is_allowed_url
+from .filters import is_social_url, platform_for_url
+from .face_match import compare_faces, download_image
 from .serpapi_fallback import search_lens
 
 
-def search_web(
-    image_path: str,
-    face_encoding: Any = None,
-) -> dict:
-    """
-    Search the public web for visually similar results.
-
-    Face verification is performed against downloaded candidate
-    images. Search-result ranking is never treated as identity
-    confidence.
-    """
-
     candidates = []
 
-    # Google Vision is optional. If it is unavailable, billing is
-    # disabled, or credentials are missing, SerpApi remains usable.
-    try:
-        vision_candidates = _vision_candidates(
-            image_path
+    for item in data.get("pages", []):
+        url = item.get("url")
+
+        if not url or not is_social_url(url):
+            continue
+
+        match_type = item.get("match_type")
+
+        confidence = {
+            "full": 0.90,
+            "partial": 0.75,
+        }.get(match_type, 0.65)
+
+        candidates.append(
+            {
+                "url": url,
+                "image_url": item.get("image_url"),
+                "caption": None,
+                "author": None,
+                "timestamp": None,
+                "confidence": confidence,
+                "source": "vision",
+                "platform": platform_for_url(url),
+            }
         )
+
+    return candidates
 
         candidates.extend(
             vision_candidates
         )
 
-    except Exception as exc:
-        print(
-            f"Google Vision search unavailable: {exc}"
+def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = []
+
+    for item in items:
+        url = item.get("url")
+
+        if not url:
+            continue
+
+        position = int(item.get("position", 0))
+
+        candidates.append(
+            {
+                "url": url,
+                "image_url": item.get("image_url"),
+                "caption": item.get("caption"),
+                "author": item.get("author"),
+                "timestamp": item.get("timestamp"),
+                "confidence": round(
+                    max(0.40, 0.90 - min(position, 10) * 0.04),
+                    2,
+                ),
+                "source": "serpapi",
+                "platform": platform_for_url(url),
+            }
         )
+
+    return candidates
 
     # SerpApi provides the main Google Lens fallback.
     if not candidates:
@@ -55,26 +107,66 @@ def search_web(
                 f"SerpApi search failed: {exc}"
             )
 
+def _select_best(
+    candidates: list[dict[str, Any]],
+    reference_image: str,
+) -> dict[str, Any] | None:
+
     if not candidates:
-        return {
-            "success": False,
-            "message": "No public web candidates found.",
-            "candidates": [],
-        }
+        return None
 
-    # Remove duplicates while preserving order.
-    candidates = _deduplicate(
-        candidates
+    verified_candidates = []
+
+    for candidate in candidates:
+        image_url = candidate.get("image_url")
+
+        if not image_url:
+            continue
+
+        candidate_path = None
+
+        try:
+            print(f"Checking candidate: {candidate['url']}")
+
+            candidate_path = download_image(image_url)
+
+            face_result = compare_faces(
+                reference_image,
+                candidate_path,
+            )
+
+            candidate["face_verified"] = face_result["verified"]
+            candidate["face_distance"] = face_result["distance"]
+            candidate["face_threshold"] = face_result["threshold"]
+
+            print(
+                f"Face verified: {candidate['face_verified']} | "
+                f"distance: {candidate['face_distance']}"
+            )
+
+            if face_result["verified"]:
+                verified_candidates.append(candidate)
+
+        except Exception as exc:
+            candidate["face_verified"] = False
+            candidate["face_distance"] = None
+            print(f"Could not verify candidate: {exc}")
+
+        finally:
+            if candidate_path and os.path.exists(candidate_path):
+                os.remove(candidate_path)
+
+    if not verified_candidates:
+        return None
+
+    # FaceNet distance:
+    # lower distance = more similar face.
+    return min(
+        verified_candidates,
+        key=lambda item: item["face_distance"]
+        if item["face_distance"] is not None
+        else float("inf"),
     )
-
-    # Keep public web pages, including non-social pages.
-    candidates = [
-        candidate
-        for candidate in candidates
-        if is_allowed_url(
-            candidate.get("url", "")
-        )
-    ]
 
     if not candidates:
         return {
@@ -83,126 +175,71 @@ def search_web(
             "candidates": [],
         }
 
-    verified = []
+def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
+    """Search the supplied image and return verified web evidence."""
 
-    for candidate in candidates:
-        image_url = candidate.get(
-            "image_url"
+    image_path = p1_payload.get("image_path")
+
+    if not image_path:
+        raise ValueError("P2 input must contain image_path")
+
+    if not Path(image_path).is_file():
+        raise FileNotFoundError(
+            f"Image not found: {image_path}"
         )
 
-        if not image_url:
-            continue
+    vision_error: str | None = None
 
-        print(
-            "\nChecking candidate:"
-        )
-        print(
-            f"  {candidate.get('url')}"
-        )
-
-        image_path_candidate = None
-
-        try:
-            image_path_candidate = download_image(
-                image_url
-            )
-
-            match = compare_faces(
-                image_path,
-                image_path_candidate,
-            )
-
-            candidate = {
-                **candidate,
-                "face_verified": match[
-                    "verified"
-                ],
-                "face_distance": match[
-                    "distance"
-                ],
-                "face_threshold": match[
-                    "threshold"
-                ],
-            }
-
-            print(
-                f"  Face verified: "
-                f"{match['verified']}"
-            )
-
-            print(
-                f"  Face distance: "
-                f"{match['distance']:.4f}"
-            )
-
-            print(
-                f"  Face threshold: "
-                f"{match['threshold']:.4f}"
-            )
-
-            if match["verified"]:
-                verified.append(
-                    candidate
-                )
-
-        except Exception as exc:
-            print(
-                f"  Face comparison failed: {exc}"
-            )
-
-        finally:
-            if (
-                image_path_candidate
-                and _file_exists(
-                    image_path_candidate
-                )
-            ):
-                _remove_file(
-                    image_path_candidate
-                )
-
-    if not verified:
-        return {
-            "success": True,
-            "message": (
-                "Public web results were found, "
-                "but no candidate image passed face verification."
-            ),
-            "candidates": _annotate_unverified(
-                candidates
-            ),
-        }
-
-    # The smallest FaceNet distance is the strongest
-    # verified visual match.
-    best = min(
-        verified,
-        key=lambda item: item.get(
-            "face_distance",
-            float("inf"),
-        ),
-    )
-
-    # Try to turn a generic result page into a more-specific
-    # page when the matching image is linked from that page.
-    profile = None
+    # ---------------------------------------------------------
+    # 1. Try Google Cloud Vision
+    # ---------------------------------------------------------
 
     try:
-        profile = resolve_profile_page(
-            best["url"],
+        vision_data = detect_web(image_path)
+
+        candidate = _select_best(
+            _vision_candidates(vision_data),
+            image_path,
+        )
+
+        if candidate:
+            return _output(candidate)
+
+    except Exception as exc:
+        vision_error = str(exc)
+
+    # ---------------------------------------------------------
+    # 2. Fall back to SerpApi / Google Lens
+    # ---------------------------------------------------------
+
+    try:
+        serp_results = search_lens(image_path)
+
+        candidate = _select_best(
+            _serp_candidates(serp_results),
             image_path,
         )
 
     except Exception as exc:
-        print(
-            f"Profile-page resolution failed: {exc}"
+
+        if vision_error:
+            raise RuntimeError(
+                f"Vision search failed: {vision_error}; "
+                f"SerpApi fallback failed: {exc}"
+            ) from exc
+
+        raise
+
+    # ---------------------------------------------------------
+    # 3. No face-verified result
+    # ---------------------------------------------------------
+
+    if not candidate:
+        raise LookupError(
+            "No face-verified result found from Vision or SerpApi"
         )
 
-    result = _build_result(
-        best,
-        profile,
-        verified,
-    )
+    return _output(candidate)
 
     return result
 
@@ -227,226 +264,52 @@ def _build_result(
         )
 
     return {
-        "success": True,
-        "matched_url": matched_url,
-        "original_matched_url": original_url,
-        "profile_url": (
-            profile.get("profile_url")
-            if profile
-            else None
+        "matched_url": candidate["url"],
+        "platform": candidate.get("platform"),
+        "image_url": candidate.get("image_url"),
+        "caption": candidate.get("caption"),
+        "author": candidate.get("author"),
+        "timestamp": candidate.get("timestamp"),
+        "confidence": round(
+            float(candidate.get("confidence", 0.0)),
+            2,
         ),
-        "title": best.get(
-            "title"
-        ),
-        "caption": best.get(
-            "caption"
-        ),
-        "author": best.get(
-            "author"
-        ),
-        "timestamp": best.get(
-            "timestamp"
-        ),
-        "face_verified": best.get(
+        "face_verified": candidate.get(
             "face_verified",
             False,
         ),
-        "face_distance": best.get(
+        "face_distance": candidate.get(
             "face_distance"
         ),
-        "face_threshold": best.get(
-            "face_threshold"
-        ),
-        # Kept for compatibility with the existing
-        # evidence/blockchain pipeline. This is NOT
-        # identity certainty.
-        "confidence": _search_confidence(
-            best
-        ),
-        "search_confidence": _search_confidence(
-            best
-        ),
-        "verified_candidates": len(
-            verified
-        ),
-        "source": best.get(
-            "source"
-        ),
-        "candidate": best,
     }
 
 
-def _search_confidence(
-    candidate: dict,
-) -> float:
-    """
-    Estimate search-result strength.
-
-    This value describes the search result, NOT the probability
-    that the person is the subject.
-    """
-
-    position = candidate.get(
-        "position"
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="P2 live web/social evidence search"
     )
 
-    if isinstance(
-        position,
-        int,
-    ):
-        return round(
-            max(
-                0.0,
-                1.0
-                - (
-                    position
-                    / 20.0
-                ),
-            ),
-            3,
-        )
-
-    return 0.0
-
-
-def _annotate_unverified(
-    candidates: list[dict],
-) -> list[dict]:
-    """Return candidates with explicit face-verification status."""
-
-    annotated = []
-
-    for candidate in candidates:
-        annotated.append(
-            {
-                **candidate,
-                "face_verified": False,
-                "face_distance": None,
-                "face_threshold": None,
-            }
-        )
-
-    return annotated
-
-
-def _deduplicate(
-    candidates: list[dict],
-) -> list[dict]:
-    """Remove duplicate URLs."""
-
-    output = []
-    seen = set()
-
-    for candidate in candidates:
-        url = candidate.get(
-            "url"
-        )
-
-        if not url or url in seen:
-            continue
-
-        seen.add(url)
-        output.append(
-            candidate
-        )
-
-    return output
-
-
-def _vision_candidates(
-    image_path: str,
-) -> list[dict]:
-    """
-    Query Google Cloud Vision Web Detection.
-
-    This function is intentionally isolated so the rest of the
-    pipeline continues working when Vision billing is unavailable.
-    """
-
-    from google.cloud import vision
-
-    client = vision.ImageAnnotatorClient()
-
-    with open(
-        image_path,
-        "rb",
-    ) as image_file:
-        content = image_file.read()
-
-    image = vision.Image(
-        content=content
+    parser.add_argument(
+        "image",
+        help="Path to the consenting demo image",
     )
 
-    response = client.web_detection(
-        image=image
-    )
+    args = parser.parse_args()
 
-    if response.error.message:
-        raise RuntimeError(
-            response.error.message
+    payload = {
+        "image_path": args.image,
+        "face_encoding": [],
+    }
+
+    result = search_web(payload)
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False,
         )
-
-    detection = (
-        response.web_detection
     )
-
-    candidates = []
-
-    for position, page in enumerate(
-        detection.pages_with_matching_images
-    ):
-        url = page.url
-
-        if not url:
-            continue
-
-        candidates.append(
-            {
-                "url": url,
-                "image_url": getattr(
-                    page,
-                    "full_matching_images",
-                    [None],
-                )[0].url
-                if getattr(
-                    page,
-                    "full_matching_images",
-                    None,
-                )
-                else None,
-                "title": None,
-                "caption": None,
-                "author": None,
-                "timestamp": None,
-                "position": position,
-                "source": "google_vision",
-            }
-        )
-
-    return candidates
-
-
-def _file_exists(
-    path: str,
-) -> bool:
-    import os
-
-    return os.path.exists(
-        path
-    )
-
-
-def _remove_file(
-    path: str,
-) -> None:
-    import os
-
-    try:
-        os.remove(
-            path
-        )
-    except OSError:
-        pass
 
 
 if __name__ == "__main__":
