@@ -1,4 +1,23 @@
-"""Live web/social evidence discovery for P2."""
+"""Public P2 web/social search interface.
+
+Input:
+    {"image_path": str, "face_encoding": [...]}
+
+Output:
+    {
+      "matched_url": str,
+      "platform": str | None,
+      "image_url": str | None,
+      "caption": str | None,
+      "author": str | None,
+      "timestamp": str | None,
+      "confidence": float,
+      "face_verified": bool,
+      "face_distance": float | None
+    }
+
+The search is live. No URL is hardcoded.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +27,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .filters import platform_for_url
 from .face_match import compare_faces, download_image
-from .filters import is_social_url, platform_for_url
 from .serpapi_fallback import search_lens
 from .vision_search import detect_web
 
@@ -21,7 +40,7 @@ def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
     for item in data.get("pages", []):
         url = item.get("url")
 
-        if not url or not is_social_url(url):
+        if not url:
             continue
 
         match_type = item.get("match_type")
@@ -48,13 +67,13 @@ def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert SerpApi/Lens results into candidates."""
+    """Convert SerpApi/Google Lens results into candidates."""
     candidates: list[dict[str, Any]] = []
 
     for item in items:
         url = item.get("url")
 
-        if not url or not is_social_url(url):
+        if not url:
             continue
 
         position = int(item.get("position", 0))
@@ -84,7 +103,7 @@ def _select_best(
     candidates: list[dict[str, Any]],
     reference_image: str,
 ) -> dict[str, Any] | None:
-    """Face-verify candidates and return the closest verified match."""
+    """Face-verify candidates and return the strongest verified match."""
 
     if not candidates:
         return None
@@ -110,10 +129,10 @@ def _select_best(
             )
 
             candidate["face_verified"] = bool(
-                face_result.get("verified", False)
+                face_result["verified"]
             )
-            candidate["face_distance"] = face_result.get("distance")
-            candidate["face_threshold"] = face_result.get("threshold")
+            candidate["face_distance"] = face_result["distance"]
+            candidate["face_threshold"] = face_result["threshold"]
 
             print(
                 f"Face verified: {candidate['face_verified']} | "
@@ -126,7 +145,10 @@ def _select_best(
         except Exception as exc:
             candidate["face_verified"] = False
             candidate["face_distance"] = None
-            print(f"Could not verify candidate: {exc}")
+
+            print(
+                f"Could not verify candidate: {exc}"
+            )
 
         finally:
             if candidate_path and os.path.exists(candidate_path):
@@ -135,6 +157,7 @@ def _select_best(
     if not verified_candidates:
         return None
 
+    # Lower FaceNet distance = stronger facial similarity.
     return min(
         verified_candidates,
         key=lambda item: (
@@ -145,41 +168,15 @@ def _select_best(
     )
 
 
-def _output(candidate: dict[str, Any]) -> dict[str, Any]:
-    """Build the P2 → P3 evidence contract."""
-    return {
-        "matched_url": candidate.get("url"),
-        "platform": candidate.get("platform"),
-        "image_url": candidate.get("image_url"),
-        "caption": candidate.get("caption"),
-        "author": candidate.get("author"),
-        "timestamp": candidate.get("timestamp"),
-        "confidence": round(
-            float(candidate.get("confidence", 0.0)),
-            2,
-        ),
-        "face_verified": bool(
-            candidate.get("face_verified", False)
-        ),
-        "face_distance": candidate.get("face_distance"),
-    }
-
-
 def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Search the supplied image and return face-verified web evidence.
-
-    Expected input:
-        {
-            "image_path": "...",
-            "face_encoding": [...]
-        }
-    """
+    """Search the supplied image and return verified web evidence."""
 
     image_path = p1_payload.get("image_path")
 
     if not image_path:
-        raise ValueError("P1 payload must contain image_path")
+        raise ValueError(
+            "P2 input must contain image_path"
+        )
 
     if not Path(image_path).is_file():
         raise FileNotFoundError(
@@ -189,7 +186,7 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
     vision_error: str | None = None
 
     # ---------------------------------------------------------
-    # 1. Google Cloud Vision Web Detection
+    # 1. Google Cloud Vision
     # ---------------------------------------------------------
 
     try:
@@ -197,7 +194,9 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
 
         vision_data = detect_web(image_path)
 
-        vision_candidates = _vision_candidates(vision_data)
+        vision_candidates = _vision_candidates(
+            vision_data
+        )
 
         candidate = _select_best(
             vision_candidates,
@@ -210,7 +209,10 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
 
     except Exception as exc:
         vision_error = str(exc)
-        print(f"Vision search failed: {exc}")
+
+        print(
+            f"Vision search failed: {exc}"
+        )
 
     # ---------------------------------------------------------
     # 2. SerpApi / Google Lens fallback
@@ -219,9 +221,13 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
     try:
         print("Searching with SerpApi / Google Lens...")
 
-        serp_results = search_lens(image_path)
+        serp_results = search_lens(
+            image_path
+        )
 
-        serp_candidates = _serp_candidates(serp_results)
+        serp_candidates = _serp_candidates(
+            serp_results
+        )
 
         candidate = _select_best(
             serp_candidates,
@@ -229,7 +235,10 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
         )
 
         if candidate:
-            print("Found a face-verified SerpApi result.")
+            print(
+                "Found a face-verified "
+                "SerpApi result."
+            )
             return _output(candidate)
 
     except Exception as exc:
@@ -248,18 +257,58 @@ def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
     # ---------------------------------------------------------
 
     raise LookupError(
-        "No face-verified result found from Vision or SerpApi."
+        "No face-verified result found "
+        "from Vision or SerpApi."
     )
+
+
+def _output(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the P2 → P3 evidence contract."""
+
+    return {
+        "matched_url": candidate.get("url"),
+        "platform": candidate.get("platform"),
+        "image_url": candidate.get("image_url"),
+        "caption": candidate.get("caption"),
+        "author": candidate.get("author"),
+        "timestamp": candidate.get("timestamp"),
+        "confidence": round(
+            float(
+                candidate.get(
+                    "confidence",
+                    0.0,
+                )
+            ),
+            2,
+        ),
+        "face_verified": bool(
+            candidate.get(
+                "face_verified",
+                False,
+            )
+        ),
+        "face_distance": candidate.get(
+            "face_distance"
+        ),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="P2 live web/social evidence search"
+        description=(
+            "P2 live web/social "
+            "evidence search"
+        )
     )
 
     parser.add_argument(
         "image",
-        help="Path to the consenting demo image",
+        help=(
+            "Path to the consenting "
+            "demo image"
+        ),
     )
 
     args = parser.parse_args()
