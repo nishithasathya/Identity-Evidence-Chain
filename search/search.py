@@ -56,13 +56,14 @@ def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates = []
+
     for item in items:
         url = item.get("url")
-        platform = platform_for_url(url or "")
-        if not url or platform not in SOCIAL_PLATFORMS:
+        if not url:
             continue
+
         position = int(item.get("position", 0))
-        confidence = max(0.55, 0.82 - min(position, 10) * 0.03)
+
         candidates.append(
             {
                 "url": url,
@@ -70,11 +71,15 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "caption": item.get("caption"),
                 "author": item.get("author"),
                 "timestamp": item.get("timestamp"),
-                "confidence": round(confidence, 2),
+                "confidence": round(
+                    max(0.40, 0.90 - min(position, 10) * 0.04),
+                    2,
+                ),
                 "source": "serpapi",
-                "platform": platform,
+                "platform": platform_for_url(url),
             }
         )
+
     return candidates
 
 
