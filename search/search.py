@@ -11,7 +11,9 @@ Output:
       "caption": str | None,
       "author": str | None,
       "timestamp": str | None,
-      "confidence": float
+      "confidence": float,
+      "face_verified": bool,
+      "face_distance": float | None
     }
 
 The search is live. No social URL is hardcoded.
@@ -21,24 +23,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from .filters import is_social_url, platform_for_url
+from .face_match import compare_faces, download_image
 from .serpapi_fallback import search_lens
 from .vision_search import detect_web
-
-SOCIAL_PLATFORMS = {"instagram", "twitter", "linkedin", "facebook"}
 
 
 def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = []
+
     for item in data.get("pages", []):
         url = item.get("url")
+
         if not url or not is_social_url(url):
             continue
+
         match_type = item.get("match_type")
-        confidence = {"full": 0.90, "partial": 0.75}.get(match_type, 0.65)
+
+        confidence = {
+            "full": 0.90,
+            "partial": 0.75,
+        }.get(match_type, 0.65)
+
         candidates.append(
             {
                 "url": url,
@@ -51,6 +61,7 @@ def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
                 "platform": platform_for_url(url),
             }
         )
+
     return candidates
 
 
@@ -59,6 +70,7 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     for item in items:
         url = item.get("url")
+
         if not url:
             continue
 
@@ -83,69 +95,183 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return candidates
 
 
-def _select_best(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _select_best(
+    candidates: list[dict[str, Any]],
+    reference_image: str,
+) -> dict[str, Any] | None:
+
     if not candidates:
         return None
-    # Prefer confidence, then richer metadata, then a stable platform order.
-    platform_bonus = {"instagram": 0.03, "twitter": 0.02, "linkedin": 0.01, "facebook": 0.0}
 
-    def key(item: dict[str, Any]) -> tuple[float, int]:
-        richness = sum(bool(item.get(k)) for k in ("image_url", "caption", "author", "timestamp"))
-        score = float(item.get("confidence", 0.0)) + platform_bonus.get(item.get("platform"), 0)
-        return score, richness
+    verified_candidates = []
 
-    return max(candidates, key=key)
+    for candidate in candidates:
+        image_url = candidate.get("image_url")
+
+        if not image_url:
+            continue
+
+        candidate_path = None
+
+        try:
+            print(f"Checking candidate: {candidate['url']}")
+
+            candidate_path = download_image(image_url)
+
+            face_result = compare_faces(
+                reference_image,
+                candidate_path,
+            )
+
+            candidate["face_verified"] = face_result["verified"]
+            candidate["face_distance"] = face_result["distance"]
+            candidate["face_threshold"] = face_result["threshold"]
+
+            print(
+                f"Face verified: {candidate['face_verified']} | "
+                f"distance: {candidate['face_distance']}"
+            )
+
+            if face_result["verified"]:
+                verified_candidates.append(candidate)
+
+        except Exception as exc:
+            candidate["face_verified"] = False
+            candidate["face_distance"] = None
+            print(f"Could not verify candidate: {exc}")
+
+        finally:
+            if candidate_path and os.path.exists(candidate_path):
+                os.remove(candidate_path)
+
+    if not verified_candidates:
+        return None
+
+    # FaceNet distance:
+    # lower distance = more similar face.
+    return min(
+        verified_candidates,
+        key=lambda item: item["face_distance"]
+        if item["face_distance"] is not None
+        else float("inf"),
+    )
 
 
 def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
-    """Search the supplied image and return the P2 → P3 evidence contract."""
+    """Search the supplied image and return verified web evidence."""
+
     image_path = p1_payload.get("image_path")
+
     if not image_path:
         raise ValueError("P2 input must contain image_path")
+
     if not Path(image_path).is_file():
-        raise FileNotFoundError(f"Image not found: {image_path}")
+        raise FileNotFoundError(
+            f"Image not found: {image_path}"
+        )
 
     vision_error: str | None = None
+
+    # ---------------------------------------------------------
+    # 1. Try Google Cloud Vision
+    # ---------------------------------------------------------
+
     try:
         vision_data = detect_web(image_path)
-        candidate = _select_best(_vision_candidates(vision_data))
+
+        candidate = _select_best(
+            _vision_candidates(vision_data),
+            image_path,
+        )
+
         if candidate:
             return _output(candidate)
-    except Exception as exc:  # noqa: BLE001 - fallback is intentional
+
+    except Exception as exc:
         vision_error = str(exc)
 
+    # ---------------------------------------------------------
+    # 2. Fall back to SerpApi / Google Lens
+    # ---------------------------------------------------------
+
     try:
-        candidate = _select_best(_serp_candidates(search_lens(image_path)))
-    except Exception as exc:  # noqa: BLE001 - surface a useful combined error
+        serp_results = search_lens(image_path)
+
+        candidate = _select_best(
+            _serp_candidates(serp_results),
+            image_path,
+        )
+
+    except Exception as exc:
+
         if vision_error:
-            raise RuntimeError(f"Vision search failed: {vision_error}; SerpApi fallback failed: {exc}") from exc
+            raise RuntimeError(
+                f"Vision search failed: {vision_error}; "
+                f"SerpApi fallback failed: {exc}"
+            ) from exc
+
         raise
 
+    # ---------------------------------------------------------
+    # 3. No face-verified result
+    # ---------------------------------------------------------
+
     if not candidate:
-        raise LookupError("No supported social-media result found from Vision or SerpApi")
+        raise LookupError(
+            "No face-verified result found from Vision or SerpApi"
+        )
+
     return _output(candidate)
 
 
 def _output(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         "matched_url": candidate["url"],
-        "platform": candidate["platform"],
+        "platform": candidate.get("platform"),
         "image_url": candidate.get("image_url"),
         "caption": candidate.get("caption"),
         "author": candidate.get("author"),
         "timestamp": candidate.get("timestamp"),
-        "confidence": round(float(candidate.get("confidence", 0.0)), 2),
+        "confidence": round(
+            float(candidate.get("confidence", 0.0)),
+            2,
+        ),
+        "face_verified": candidate.get(
+            "face_verified",
+            False,
+        ),
+        "face_distance": candidate.get(
+            "face_distance"
+        ),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="P2 live web/social evidence search")
-    parser.add_argument("image", help="Path to the consenting demo image")
+    parser = argparse.ArgumentParser(
+        description="P2 live web/social evidence search"
+    )
+
+    parser.add_argument(
+        "image",
+        help="Path to the consenting demo image",
+    )
+
     args = parser.parse_args()
 
-    payload = {"image_path": args.image, "face_encoding": []}
+    payload = {
+        "image_path": args.image,
+        "face_encoding": [],
+    }
+
     result = search_web(payload)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
