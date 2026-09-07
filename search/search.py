@@ -1,23 +1,4 @@
-"""Public P2 web/social search interface.
-
-Input:
-    {"image_path": str, "face_encoding": [...]}
-
-Output:
-    {
-      "matched_url": str,
-      "platform": str,
-      "image_url": str | None,
-      "caption": str | None,
-      "author": str | None,
-      "timestamp": str | None,
-      "confidence": float,
-      "face_verified": bool,
-      "face_distance": float | None
-    }
-
-The search is live. No social URL is hardcoded.
-"""
+"""Live web/social evidence discovery for P2."""
 
 from __future__ import annotations
 
@@ -27,12 +8,15 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .filters import is_social_url, platform_for_url
 from .face_match import compare_faces, download_image
+from .filters import is_social_url, platform_for_url
 from .serpapi_fallback import search_lens
+from .vision_search import detect_web
 
 
-    candidates = []
+def _vision_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert Google Vision Web Detection results into candidates."""
+    candidates: list[dict[str, Any]] = []
 
     for item in data.get("pages", []):
         url = item.get("url")
@@ -51,9 +35,9 @@ from .serpapi_fallback import search_lens
             {
                 "url": url,
                 "image_url": item.get("image_url"),
-                "caption": None,
-                "author": None,
-                "timestamp": None,
+                "caption": item.get("caption"),
+                "author": item.get("author"),
+                "timestamp": item.get("timestamp"),
                 "confidence": confidence,
                 "source": "vision",
                 "platform": platform_for_url(url),
@@ -62,20 +46,23 @@ from .serpapi_fallback import search_lens
 
     return candidates
 
-        candidates.extend(
-            vision_candidates
-        )
 
 def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    candidates = []
+    """Convert SerpApi/Lens results into candidates."""
+    candidates: list[dict[str, Any]] = []
 
     for item in items:
         url = item.get("url")
 
-        if not url:
+        if not url or not is_social_url(url):
             continue
 
         position = int(item.get("position", 0))
+
+        confidence = round(
+            max(0.40, 0.90 - min(position, 10) * 0.04),
+            2,
+        )
 
         candidates.append(
             {
@@ -84,10 +71,7 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "caption": item.get("caption"),
                 "author": item.get("author"),
                 "timestamp": item.get("timestamp"),
-                "confidence": round(
-                    max(0.40, 0.90 - min(position, 10) * 0.04),
-                    2,
-                ),
+                "confidence": confidence,
                 "source": "serpapi",
                 "platform": platform_for_url(url),
             }
@@ -95,27 +79,17 @@ def _serp_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     return candidates
 
-    # SerpApi provides the main Google Lens fallback.
-    if not candidates:
-        try:
-            candidates = search_lens(
-                image_path
-            )
-
-        except Exception as exc:
-            print(
-                f"SerpApi search failed: {exc}"
-            )
 
 def _select_best(
     candidates: list[dict[str, Any]],
     reference_image: str,
 ) -> dict[str, Any] | None:
+    """Face-verify candidates and return the closest verified match."""
 
     if not candidates:
         return None
 
-    verified_candidates = []
+    verified_candidates: list[dict[str, Any]] = []
 
     for candidate in candidates:
         image_url = candidate.get("image_url")
@@ -123,7 +97,7 @@ def _select_best(
         if not image_url:
             continue
 
-        candidate_path = None
+        candidate_path: str | None = None
 
         try:
             print(f"Checking candidate: {candidate['url']}")
@@ -135,16 +109,18 @@ def _select_best(
                 candidate_path,
             )
 
-            candidate["face_verified"] = face_result["verified"]
-            candidate["face_distance"] = face_result["distance"]
-            candidate["face_threshold"] = face_result["threshold"]
+            candidate["face_verified"] = bool(
+                face_result.get("verified", False)
+            )
+            candidate["face_distance"] = face_result.get("distance")
+            candidate["face_threshold"] = face_result.get("threshold")
 
             print(
                 f"Face verified: {candidate['face_verified']} | "
                 f"distance: {candidate['face_distance']}"
             )
 
-            if face_result["verified"]:
+            if candidate["face_verified"]:
                 verified_candidates.append(candidate)
 
         except Exception as exc:
@@ -159,112 +135,20 @@ def _select_best(
     if not verified_candidates:
         return None
 
-    # FaceNet distance:
-    # lower distance = more similar face.
     return min(
         verified_candidates,
-        key=lambda item: item["face_distance"]
-        if item["face_distance"] is not None
-        else float("inf"),
+        key=lambda item: (
+            item["face_distance"]
+            if item.get("face_distance") is not None
+            else float("inf")
+        ),
     )
 
-    if not candidates:
-        return {
-            "success": False,
-            "message": "No allowed public web candidates found.",
-            "candidates": [],
-        }
 
-def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
-    """Search the supplied image and return verified web evidence."""
-
-    image_path = p1_payload.get("image_path")
-
-    if not image_path:
-        raise ValueError("P2 input must contain image_path")
-
-    if not Path(image_path).is_file():
-        raise FileNotFoundError(
-            f"Image not found: {image_path}"
-        )
-
-    vision_error: str | None = None
-
-    # ---------------------------------------------------------
-    # 1. Try Google Cloud Vision
-    # ---------------------------------------------------------
-
-    try:
-        vision_data = detect_web(image_path)
-
-        candidate = _select_best(
-            _vision_candidates(vision_data),
-            image_path,
-        )
-
-        if candidate:
-            return _output(candidate)
-
-    except Exception as exc:
-        vision_error = str(exc)
-
-    # ---------------------------------------------------------
-    # 2. Fall back to SerpApi / Google Lens
-    # ---------------------------------------------------------
-
-    try:
-        serp_results = search_lens(image_path)
-
-        candidate = _select_best(
-            _serp_candidates(serp_results),
-            image_path,
-        )
-
-    except Exception as exc:
-
-        if vision_error:
-            raise RuntimeError(
-                f"Vision search failed: {vision_error}; "
-                f"SerpApi fallback failed: {exc}"
-            ) from exc
-
-        raise
-
-    # ---------------------------------------------------------
-    # 3. No face-verified result
-    # ---------------------------------------------------------
-
-    if not candidate:
-        raise LookupError(
-            "No face-verified result found from Vision or SerpApi"
-        )
-
-    return _output(candidate)
-
-    return result
-
-
-def _build_result(
-    best: dict,
-    profile: dict | None,
-    verified: list[dict],
-) -> dict:
-    """Build a stable result object for downstream evidence storage."""
-
-    original_url = best.get(
-        "url"
-    )
-
-    matched_url = original_url
-
-    if profile:
-        matched_url = profile.get(
-            "profile_url",
-            original_url,
-        )
-
+def _output(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build the P2 → P3 evidence contract."""
     return {
-        "matched_url": candidate["url"],
+        "matched_url": candidate.get("url"),
         "platform": candidate.get("platform"),
         "image_url": candidate.get("image_url"),
         "caption": candidate.get("caption"),
@@ -274,14 +158,98 @@ def _build_result(
             float(candidate.get("confidence", 0.0)),
             2,
         ),
-        "face_verified": candidate.get(
-            "face_verified",
-            False,
+        "face_verified": bool(
+            candidate.get("face_verified", False)
         ),
-        "face_distance": candidate.get(
-            "face_distance"
-        ),
+        "face_distance": candidate.get("face_distance"),
     }
+
+
+def search_web(p1_payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Search the supplied image and return face-verified web evidence.
+
+    Expected input:
+        {
+            "image_path": "...",
+            "face_encoding": [...]
+        }
+    """
+
+    image_path = p1_payload.get("image_path")
+
+    if not image_path:
+        raise ValueError("P1 payload must contain image_path")
+
+    if not Path(image_path).is_file():
+        raise FileNotFoundError(
+            f"Image not found: {image_path}"
+        )
+
+    vision_error: str | None = None
+
+    # ---------------------------------------------------------
+    # 1. Google Cloud Vision Web Detection
+    # ---------------------------------------------------------
+
+    try:
+        print("Searching with Google Cloud Vision...")
+
+        vision_data = detect_web(image_path)
+
+        vision_candidates = _vision_candidates(vision_data)
+
+        candidate = _select_best(
+            vision_candidates,
+            image_path,
+        )
+
+        if candidate:
+            print("Found a face-verified Vision result.")
+            return _output(candidate)
+
+    except Exception as exc:
+        vision_error = str(exc)
+        print(f"Vision search failed: {exc}")
+
+    # ---------------------------------------------------------
+    # 2. SerpApi / Google Lens fallback
+    # ---------------------------------------------------------
+
+    try:
+        print("Searching with SerpApi / Google Lens...")
+
+        serp_results = search_lens(image_path)
+
+        serp_candidates = _serp_candidates(serp_results)
+
+        candidate = _select_best(
+            serp_candidates,
+            image_path,
+        )
+
+        if candidate:
+            print("Found a face-verified SerpApi result.")
+            return _output(candidate)
+
+    except Exception as exc:
+        if vision_error:
+            raise RuntimeError(
+                f"Vision search failed: {vision_error}; "
+                f"SerpApi fallback failed: {exc}"
+            ) from exc
+
+        raise RuntimeError(
+            f"SerpApi fallback failed: {exc}"
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 3. No verified result
+    # ---------------------------------------------------------
+
+    raise LookupError(
+        "No face-verified result found from Vision or SerpApi."
+    )
 
 
 def main() -> None:
@@ -313,7 +281,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    print(
-        "Use main.py to run the complete "
-        "Identity-Evidence-Chain pipeline."
-    )
+    main()
