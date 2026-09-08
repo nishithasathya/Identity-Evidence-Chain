@@ -1,6 +1,6 @@
 from web3 import Web3
 import json
-from evidence import hash_evidence
+from .evidence import hash_evidence
 
 
 RPC_URL = "http://127.0.0.1:7545"
