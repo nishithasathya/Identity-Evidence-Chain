@@ -380,33 +380,38 @@ def _verify_image(
     reference_image: str,
     image_url: str,
 ) -> dict | None:
-    """Download and face-verify one image."""
+    """Download and face-verify one image, with diagnostics."""
 
     image_path = None
 
     try:
-        image_path = download_image(
-            image_url
-        )
+        image_path = download_image(image_url)
 
         result = compare_faces(
             reference_image,
             image_path,
         )
 
-        if not result["verified"]:
+        distance = result["distance"]
+        threshold = result["threshold"]
+        verified = result["verified"]
+
+        print(
+            f"    Face verified: {verified} "
+            f"| distance: {distance:.6f} "
+            f"| threshold: {threshold:.6f}"
+        )
+
+        if not verified:
             return None
 
         return {
-            "face_distance": result[
-                "distance"
-            ],
-            "face_threshold": result[
-                "threshold"
-            ],
+            "face_distance": distance,
+            "face_threshold": threshold,
         }
 
-    except Exception:
+    except Exception as exc:
+        print(f"    Face verification error: {exc}")
         return None
 
     finally:
